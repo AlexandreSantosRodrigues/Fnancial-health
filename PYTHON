@@ -1,0 +1,516 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import warnings
+
+warnings.filterwarnings('ignore')
+
+CAMINHO_KAGGLE = '/kaggle/input/datasets/alexandresanto/financee/Financial Transactions.csv'
+
+# 1. Leitura Inteligente
+df = pd.read_csv(CAMINHO_KAGGLE, sep=None, engine='python')
+df.columns = df.columns.str.strip()
+
+# 2. Busca Dinâmica da Coluna de Data
+possiveis_nomes_data = ['Timestamp', 'timestamp', 'Date', 'date', 'Data', 'data', 'Time', 'time']
+coluna_tempo = next((col for col in possiveis_nomes_data if col in df.columns), None)
+
+if coluna_tempo is None:
+    raise ValueError(f"❌ Coluna de data não encontrada. Colunas: {df.columns.tolist()}")
+
+print(f"✅ SUCESSO: Coluna '{coluna_tempo}' encontrada. Iniciando conversão temporal...")
+
+# ==========================================
+# 3. CONVERSÃO TEMPORAL BLINDADA (A Correção)
+# ==========================================
+# dayfirst=True: Ensina ao Pandas que "13/01" é 13 de Janeiro, não o mês 13.
+# format='mixed': Permite que o Pandas infira o formato linha por linha se houver bagunça no CSV.
+# errors='coerce': Se houver uma linha com texto corrompido, transforma em "NaT" (Not a Time) em vez de quebrar o código.
+df['Timestamp_Padronizado'] = pd.to_datetime(
+    df[coluna_tempo], 
+    dayfirst=True, 
+    format='mixed', 
+    errors='coerce'
+)
+
+# Removendo possíveis linhas que não puderam ser convertidas em data
+df = df.dropna(subset=['Timestamp_Padronizado'])
+
+# Ordenação e extração da Data Diária
+df = df.sort_values('Timestamp_Padronizado')
+df['Date'] = df['Timestamp_Padronizado'].dt.date
+
+# ==========================================
+# 4. CLASSIFICAÇÃO DE FLUXO FINANCEIRO
+# ==========================================
+df['TransactionType'] = df['TransactionType'].astype(str).str.strip().str.lower()
+inflow_types = ['deposit']
+outflow_types = ['withdrawal', 'payment', 'transfer']
+
+df['Fluxo'] = np.where(df['TransactionType'].isin(inflow_types), 'Entrada', 
+              np.where(df['TransactionType'].isin(outflow_types), 'Saida', 'Outro'))
+
+# Agregação Diária (Pivot Table)
+liquidez_diaria = df.groupby(['Date', 'Fluxo'])['TransactionAmount'].sum().unstack(fill_value=0)
+
+# Verificação de segurança de colunas
+for col in ['Entrada', 'Saida']:
+    if col not in liquidez_diaria.columns: liquidez_diaria[col] = 0
+
+print("✅ ETL CONCLUÍDO COM SUCESSO. Base pronta e limpa!")
+display(liquidez_diaria.head())
+
+✅ SUCESSO: Coluna 'Timestamp' encontrada. Iniciando conversão temporal...
+✅ ETL CONCLUÍDO COM SUCESSO. Base pronta e limpa!
+Fluxo	Entrada	Saida
+Date		
+2016-01-01	45.04	27494.96
+2016-01-02	2514.73	23766.02
+2016-01-03	14364.80	17048.27
+2016-01-04	3957.88	39283.79
+2016-01-05	9126.21	32275.95
+
+# Importações necessárias caso não estejam na memória
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import warnings
+
+warnings.filterwarnings('ignore')
+
+print("⏳ Processando matrizes matemáticas e treinando o modelo Preditivo...")
+
+# ==========================================
+# 1. CÁLCULO DE KPIs MATEMÁTICOS
+# ==========================================
+# Fluxo de Caixa = Σ Entradas - Σ Saídas
+liquidez_diaria['Fluxo_Caixa_Diario'] = liquidez_diaria['Entrada'] - liquidez_diaria['Saida']
+
+# Saldo Acumulado (Integral discreta do Fluxo de Caixa no tempo)
+# Assumimos saldo inicial zero para fins de demonstração da variação
+liquidez_diaria['Saldo_Acumulado'] = liquidez_diaria['Fluxo_Caixa_Diario'].cumsum()
+
+# Índice de Liquidez (Saldo Disponível / Obrigação Média de 7 Dias)
+liquidez_diaria['Media_Saidas_7d'] = liquidez_diaria['Saida'].rolling(window=7, min_periods=1).mean()
+
+# Evitando divisão por zero com np.where
+liquidez_diaria['Indice_Liquidez'] = np.where(
+    liquidez_diaria['Media_Saidas_7d'] == 0, 
+    np.nan, 
+    liquidez_diaria['Saldo_Acumulado'] / liquidez_diaria['Media_Saidas_7d']
+)
+
+# ==========================================
+# 2. MODELAGEM PREDITIVA (SÉRIES TEMPORAIS)
+# ==========================================
+# Preenchendo dias sem transação com 0 (asfreq) para garantir a continuidade do tempo
+ts_fluxo = liquidez_diaria['Fluxo_Caixa_Diario'].asfreq('D').fillna(0)
+
+# Suavização Exponencial de Holt-Winters (Captura Nível, Tendência e Sazonalidade)
+try:
+    # Usamos sazonalidade de 7 dias (padrão semanal de pagamentos)
+    modelo = ExponentialSmoothing(ts_fluxo, trend='add', seasonal='add', seasonal_periods=7)
+    modelo_treinado = modelo.fit(optimized=True)
+    previsao_7d = modelo_treinado.forecast(7)
+except Exception as e:
+    print("Aviso: Utilizando média preditiva simples devido ao formato da série temporal.")
+    ultima_media = ts_fluxo.rolling(7).mean().iloc[-1]
+    datas_futuras = pd.date_range(ts_fluxo.index[-1] + pd.Timedelta(days=1), periods=7)
+    previsao_7d = pd.Series([ultima_media]*7, index=datas_futuras)
+
+# ==========================================
+# 3. DASHBOARD VISUAL (MATPLOTLIB)
+# ==========================================
+plt.style.use('seaborn-v0_8-darkgrid')
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), gridspec_kw={'height_ratios': [2, 1]})
+
+# --- Gráfico 1: Histórico e Previsão de Caixa ---
+# Mostrando os últimos 90 dias para ter contexto visual
+ax1.plot(ts_fluxo.index[-90:], ts_fluxo.values[-90:], label='Histórico Real (Últimos 90 Dias)', color='royalblue', linewidth=1.5)
+ax1.plot(previsao_7d.index, previsao_7d.values, label='Previsão de Máquina (7 Dias)', color='darkorange', linestyle='--', marker='o', markersize=8)
+
+# Linha do zero (Descasamento) e preenchimentos
+ax1.axhline(0, color='red', linestyle='-', linewidth=2, alpha=0.5, label='Linha de Descasamento (R$ 0,00)')
+ax1.fill_between(ts_fluxo.index[-90:], 0, ts_fluxo.values[-90:], where=(ts_fluxo.values[-90:] > 0), facecolor='green', alpha=0.1)
+ax1.fill_between(ts_fluxo.index[-90:], 0, ts_fluxo.values[-90:], where=(ts_fluxo.values[-90:] < 0), facecolor='red', alpha=0.1)
+
+ax1.set_title('Tesouraria: Dinâmica de Liquidez e Projeção de Curto Prazo', fontsize=16, fontweight='bold')
+ax1.set_ylabel('Fluxo de Caixa Diário (R$)', fontsize=12)
+ax1.legend(loc='upper left', fontsize=11, framealpha=1)
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y'))
+
+# --- Gráfico 2: Índice de Liquidez ---
+historico_liquidez = liquidez_diaria['Indice_Liquidez'][-90:]
+ax2.plot(historico_liquidez.index, historico_liquidez.values, color='teal', linewidth=2, label='Índice de Liquidez')
+
+# Linhas de referência financeira
+ax2.axhline(1.0, color='crimson', linestyle='--', linewidth=2, label='Risco Iminente (< 1.0)')
+ax2.axhline(1.5, color='forestgreen', linestyle=':', linewidth=2, label='Zona de Conforto (1.5x)')
+
+ax2.set_title('Termômetro de Capital de Giro', fontsize=14, fontweight='bold')
+ax2.set_ylabel('Múltiplo de Cobertura', fontsize=12)
+ax2.legend(loc='upper right')
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y'))
+
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 4. RELATÓRIO PREDITIVO (TEXTO)
+# ==========================================
+print("\n" + "="*60)
+print("🎯 RELATÓRIO PREDITIVO DA TESOURARIA (PRÓXIMOS 7 DIAS)")
+print("="*60)
+for data, valor in previsao_7d.items():
+    if valor < 0:
+        status = "🔴 ALERTA: Descasamento (Necessidade de Capital)"
+    else:
+        status = "🟢 ESTÁVEL: Superávit Operacional Projetado"
+    print(f"Data: {data.strftime('%d/%m/%Y')} | Fluxo Previsto: R$ {valor:,.2f} | Status: {status}")
+
+
+============================================================
+🎯 RELATÓRIO PREDITIVO DA TESOURARIA (PRÓXIMOS 7 DIAS)
+============================================================
+Data: 01/07/2024 | Fluxo Previsto: R$ -14,658.12 | Status: 🔴 ALERTA: Descasamento (Necessidade de Capital)
+Data: 02/07/2024 | Fluxo Previsto: R$ -13,828.86 | Status: 🔴 ALERTA: Descasamento (Necessidade de Capital)
+Data: 03/07/2024 | Fluxo Previsto: R$ -14,202.36 | Status: 🔴 ALERTA: Descasamento (Necessidade de Capital)
+Data: 04/07/2024 | Fluxo Previsto: R$ -15,275.53 | Status: 🔴 ALERTA: Descasamento (Necessidade de Capital)
+Data: 05/07/2024 | Fluxo Previsto: R$ -15,471.18 | Status: 🔴 ALERTA: Descasamento (Necessidade de Capital)
+Data: 06/07/2024 | Fluxo Previsto: R$ -15,277.57 | Status: 🔴 ALERTA: Descasamento (Necessidade de Capital)
+Data: 07/07/2024 | Fluxo Previsto: R$ -15,337.04 | Status: 🔴 ALERTA: Descasamento (Necessidade de Capital)
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import warnings
+
+warnings.filterwarnings('ignore')
+
+print("⏳ Treinando algoritmo de Clusterização (K-Means) no histórico de saídas...")
+
+# ==========================================
+# 1. ENGENHARIA DE FEATURES (Preparando a Matriz de Comportamento)
+# ==========================================
+# Isolamos apenas as transações onde o dinheiro saiu da empresa
+df_saidas = df[df['Fluxo'] == 'Saida'].copy()
+
+# Agrupamos por AccountID (Fornecedor / Centro de Custo)
+perfil_contas = df_saidas.groupby('AccountID').agg(
+    Frequencia_Saques=('TransactionID', 'count'), # Quantas vezes cobrou?
+    Volume_Total_BRL=('TransactionAmount', 'sum')   # CORREÇÃO: Removido o '$'
+).reset_index()
+
+# Calculamos o Ticket Médio de cada conta
+perfil_contas['Ticket_Medio'] = perfil_contas['Volume_Total_BRL'] / perfil_contas['Frequencia_Saques']
+
+# ==========================================
+# 2. NORMALIZAÇÃO MATEMÁTICA
+# ==========================================
+# O K-Means calcula distâncias euclidianas. Precisamos colocar a Frequência 
+# e o Volume na mesma escala para que valores altos em R$ não esmaguem a contagem de frequência.
+features = ['Frequencia_Saques', 'Volume_Total_BRL']
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(perfil_contas[features])
+
+# ==========================================
+# 3. TREINAMENTO DO ALGORITMO K-MEANS
+# ==========================================
+# Vamos pedir para a IA dividir nossos fornecedores/despesas em 4 grupos (Clusters)
+kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+perfil_contas['Cluster'] = kmeans.fit_predict(X_scaled)
+
+# Mapeando nomes amigáveis para os Clusters com base nos centroides
+centroides = perfil_contas.groupby('Cluster')[features].mean()
+# Ordenando por volume para identificar o pior cluster
+centroides = centroides.sort_values(by='Volume_Total_BRL')
+
+mapa_nomes = {
+    centroides.index[0]: '1. Baixo Impacto (Rotina)',
+    centroides.index[1]: '2. Ticket Médio Frequente',
+    centroides.index[2]: '3. Sugadores de Caixa',
+    centroides.index[3]: '4. ALERTA: Predadores de Capital'
+}
+perfil_contas['Perfil_Financeiro'] = perfil_contas['Cluster'].map(mapa_nomes)
+
+# ==========================================
+# 4. VISUALIZAÇÃO DE INTELIGÊNCIA (DASHBOARD)
+# ==========================================
+plt.figure(figsize=(12, 8))
+sns.set_theme(style="whitegrid")
+
+# Gráfico de Dispersão (Scatter Plot)
+scatter = sns.scatterplot(
+    data=perfil_contas, 
+    x='Frequencia_Saques', 
+    y='Volume_Total_BRL', 
+    hue='Perfil_Financeiro', 
+    palette=['#2ca02c', '#1f77b4', '#ff7f0e', '#d62728'], # Cores semânticas
+    size='Ticket_Medio', sizes=(50, 400), alpha=0.7, edgecolor='black'
+)
+
+plt.title('Mapa de Calor de Despesas: Onde está o Vazamento de Caixa?', fontsize=16, fontweight='bold', pad=20)
+plt.xlabel('Frequência de Pagamentos (Qtd de Transações)', fontsize=12)
+plt.ylabel('Volume Total Drenado (R$)', fontsize=12)
+plt.legend(title='Perfil de Risco (Algoritmo)', bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 5. RELATÓRIO DE AÇÃO DA DIRETORIA
+# ==========================================
+alvo_critico = perfil_contas[perfil_contas['Perfil_Financeiro'].str.contains('Predadores')]
+print("\n" + "="*70)
+print("🎯 LISTA DE ALVOS PARA CORTE OU RENEGOCIAÇÃO IMEDIATA (Cluster 4)")
+print("="*70)
+print("Estas são as contas (AccountIDs) responsáveis pela maior drenagem de capital.")
+print("Reduzir o impacto destas contas ajudará a fechar o rombo diário.\n")
+
+# Mostra o Top 5 contas que mais sugam caixa no cluster crítico
+display(alvo_critico.sort_values('Volume_Total_BRL', ascending=False).head(5)[['AccountID', 'Frequencia_Saques', 'Ticket_Medio', 'Volume_Total_BRL']])
+
+======================================================================
+🎯 LISTA DE ALVOS PARA CORTE OU RENEGOCIAÇÃO IMEDIATA (Cluster 4)
+======================================================================
+Estas são as contas (AccountIDs) responsáveis pela maior drenagem de capital.
+Reduzir o impacto destas contas ajudará a fechar o rombo diário.
+
+AccountID	Frequencia_Saques	Ticket_Medio	Volume_Total_BRL
+2203	3292	11	3406.922727	37476.15
+1889	2970	11	3138.268182	34520.95
+7885	9248	10	3393.809000	33938.09
+6683	7997	11	2891.663636	31808.30
+6063	7355	9	3514.711111	31632.40
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+
+print("⏳ Executando Simulação Matemática de Otimização de Caixa...")
+
+# ==========================================
+# 1. CÁLCULO DA MÉTRICA DE ECONOMIA
+# ==========================================
+# Quantos dias de dados temos no total?
+dias_operacao = df['Date'].nunique()
+
+# Qual foi o volume total drenado pelos "Predadores" ao longo de todo o histórico?
+sangria_total_predadores = alvo_critico['Volume_Total_BRL'].sum()
+
+# Qual é o peso médio diário desses predadores no nosso caixa?
+sangria_diaria_media = sangria_total_predadores / dias_operacao
+
+# SIMULAÇÃO: O que acontece se a Tesouraria conseguir renegociar ou cortar 30% do custo só deste grupo?
+meta_de_corte = 0.30
+economia_diaria_projetada = sangria_diaria_media * meta_de_corte
+
+print(f"💰 Meta de Redução: 30% em cima das {len(alvo_critico)} piores contas.")
+print(f"📈 Economia Diária Estimada: Injeção virtual de R$ {economia_diaria_projetada:,.2f} por dia.\n")
+
+# ==========================================
+# 2. APLICAÇÃO DA SIMULAÇÃO NO MODELO PREDITIVO
+# ==========================================
+# Somamos a economia diária à previsão original (que estava negativa)
+previsao_otimizada = previsao_7d + economia_diaria_projetada
+
+# Recalculando o Saldo Acumulado Projetado (para os 7 dias)
+# Partimos do último saldo conhecido no histórico
+ultimo_saldo_real = liquidez_diaria['Saldo_Acumulado'].iloc[-1]
+saldo_projetado_original = previsao_7d.cumsum() + ultimo_saldo_real
+saldo_projetado_otimizado = previsao_otimizada.cumsum() + ultimo_saldo_real
+
+# ==========================================
+# 3. DASHBOARD DA SIMULAÇÃO (ANTES vs DEPOIS)
+# ==========================================
+plt.style.use('seaborn-v0_8-darkgrid')
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12), gridspec_kw={'height_ratios': [1.5, 1.5]})
+
+# --- Gráfico 1: Comparação de Fluxo de Caixa Diário ---
+ax1.plot(previsao_7d.index, previsao_7d.values, label='Cenário Original (Sem Cortes)', color='crimson', linestyle='--', marker='o', linewidth=2)
+ax1.plot(previsao_otimizada.index, previsao_otimizada.values, label='Cenário Otimizado (Corte de 30% no Cluster 4)', color='forestgreen', linestyle='-', marker='s', linewidth=3)
+
+ax1.axhline(0, color='black', linestyle='-', linewidth=1.5, alpha=0.7, label='Linha Zero (Sobrevivência)')
+ax1.set_title('Impacto da Renegociação no Fluxo de Caixa Diário (Próximos 7 Dias)', fontsize=15, fontweight='bold')
+ax1.set_ylabel('Fluxo Diário Projetado (R$)', fontsize=12)
+ax1.legend(loc='upper left', fontsize=11, shadow=True)
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%y'))
+
+# Preenchimento de área para evidenciar o ganho
+ax1.fill_between(previsao_7d.index, previsao_7d.values, previsao_otimizada.values, color='lightgreen', alpha=0.3, label='Capital Salvo')
+
+# --- Gráfico 2: Evolução do Saldo Acumulado (Reserva de Emergência) ---
+ax2.plot(saldo_projetado_original.index, saldo_projetado_original.values, color='crimson', linewidth=2, linestyle='--', label='Saldo Original Projetado')
+ax2.plot(saldo_projetado_otimizado.index, saldo_projetado_otimizado.values, color='teal', linewidth=3, label='Novo Saldo (Efeito Juros Compostos da Economia)')
+
+ax2.set_title('Projeção do Saldo em Conta Acumulado (Dinheiro em Caixa)', fontsize=15, fontweight='bold')
+ax2.set_ylabel('Saldo Total (R$)', fontsize=12)
+ax2.legend(loc='upper left', fontsize=11)
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%y'))
+
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 4. PARECER TÉCNICO
+# ==========================================
+print("\n" + "="*70)
+print("📊 RESULTADO DA SIMULAÇÃO DE CORTE")
+print("="*70)
+
+# Verificando se a otimização foi suficiente para tirar o fluxo do vermelho
+dias_salvos = sum(previsao_otimizada > 0)
+print(f"Dos 7 dias projetados, a operação otimizada fecha no AZUL em {dias_salvos} dias.")
+
+if dias_salvos >= 4:
+    print("🟢 STATUS: SUCESSO. O corte de 30% nos Predadores estabiliza a tesouraria.")
+else:
+    print("🔴 STATUS: ALERTA. O buraco é muito profundo. Apenas renegociar não salva a semana.")
+    print("   -> Ação exigida: Além do corte de custos, é obrigatório antecipar recebíveis ou injetar capital externo.")
+
+======================================================================
+📊 RESULTADO DA SIMULAÇÃO DE CORTE
+======================================================================
+Dos 7 dias projetados, a operação otimizada fecha no AZUL em 0 dias.
+🔴 STATUS: ALERTA. O buraco é muito profundo. Apenas renegociar não salva a semana.
+   -> Ação exigida: Além do corte de custos, é obrigatório antecipar recebíveis ou injetar capital externo.
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+import warnings
+
+warnings.filterwarnings('ignore')
+
+print("⏳ Treinando Random Forest para análise de Inadimplência e Comportamento...")
+
+# ==========================================
+# 1. ENGENHARIA DE FEATURES TEMPORAIS
+# ==========================================
+# Isolar apenas as Entradas (Depósitos / Pagamentos recebidos)
+df_entradas = df[df['Fluxo'] == 'Entrada'].copy()
+
+# Ordenar por cliente e data para calcular a diferença de dias entre depósitos
+df_entradas = df_entradas.sort_values(['AccountID', 'Timestamp_Padronizado'])
+df_entradas['Dias_Ate_Proximo_Pagamento'] = df_entradas.groupby('AccountID')['Timestamp_Padronizado'].diff().dt.days
+
+# Criar o Dossiê de cada Cliente (AccountID)
+dossie_clientes = df_entradas.groupby('AccountID').agg(
+    Total_Transacoes=('TransactionID', 'count'),
+    Valor_Total_Recebido=('TransactionAmount', 'sum'),
+    Ticket_Medio=('TransactionAmount', 'mean'),
+    Ultimo_Pagamento=('Timestamp_Padronizado', 'max'),
+    Intervalo_Medio_Dias=('Dias_Ate_Proximo_Pagamento', 'mean')
+).reset_index()
+
+# Para clientes que pagaram só 1 vez, assumimos um ciclo padrão comercial de 30 dias
+dossie_clientes['Intervalo_Medio_Dias'] = dossie_clientes['Intervalo_Medio_Dias'].fillna(30)
+
+# ==========================================
+# 2. CRIAÇÃO DA VARIÁVEL ALVO (RISCO ALVO)
+# ==========================================
+# Simulamos a data de "hoje" como a última transação do sistema
+data_atual_simulada = df['Timestamp_Padronizado'].max()
+dossie_clientes['Dias_Ocioso'] = (data_atual_simulada - dossie_clientes['Ultimo_Pagamento']).dt.days
+
+# Heurística de Inadimplência: Se o cliente está ocioso há 1.5x mais tempo que o seu 
+# próprio intervalo normal de pagamento, ele é marcado como "Em Atraso/Risco" (1)
+dossie_clientes['Inadimplente_Target'] = np.where(
+    dossie_clientes['Dias_Ocioso'] > (dossie_clientes['Intervalo_Medio_Dias'] * 1.5), 1, 0
+)
+
+# ==========================================
+# 3. MACHINE LEARNING (RANDOM FOREST)
+# ==========================================
+# Variáveis que a máquina vai usar para aprender o padrão
+features = ['Total_Transacoes', 'Ticket_Medio', 'Intervalo_Medio_Dias']
+X = dossie_clientes[features]
+y = dossie_clientes['Inadimplente_Target']
+
+# Divisão de treino e teste
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Configurando e treinando a Árvore de Decisão Múltipla
+rf_model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42, class_weight='balanced')
+rf_model.fit(X_train, y_train)
+
+# O modelo agora prevê a PROBABILIDADE EXATA (%) de um cliente atrasar pagamentos futuros
+dossie_clientes['Probabilidade_Atraso_Perc'] = rf_model.predict_proba(X)[:, 1] * 100
+
+# ==========================================
+# 4. DASHBOARD: MATRIZ DE RISCO VS RETORNO
+# ==========================================
+plt.figure(figsize=(14, 8))
+sns.set_theme(style="whitegrid")
+
+# Segmentação para coloração
+dossie_clientes['Categoria_Risco'] = pd.cut(
+    dossie_clientes['Probabilidade_Atraso_Perc'], 
+    bins=[-1, 30, 70, 100], 
+    labels=['Baixo Risco (Seguro)', 'Médio Risco (Atenção)', 'Alto Risco (Crítico)']
+)
+
+# Filtramos outliers visuais muito extremos para não distorcer o gráfico
+grafico_dados = dossie_clientes[dossie_clientes['Total_Transacoes'] > 1]
+
+scatter = sns.scatterplot(
+    data=grafico_dados, 
+    x='Probabilidade_Atraso_Perc', 
+    y='Ticket_Medio', 
+    hue='Categoria_Risco',
+    palette={'Baixo Risco (Seguro)': '#2ca02c', 'Médio Risco (Atenção)': '#ff7f0e', 'Alto Risco (Crítico)': '#d62728'},
+    size='Valor_Total_Recebido', sizes=(20, 600), alpha=0.7, edgecolor='black'
+)
+
+plt.title('Matriz de Recebíveis: Risco de Inadimplência vs Ticket Médio', fontsize=16, fontweight='bold', pad=20)
+plt.xlabel('Probabilidade de Atraso / Inadimplência Calculada pela IA (%)', fontsize=12)
+plt.ylabel('Ticket Médio do Cliente (R$)', fontsize=12)
+plt.axvline(30, color='green', linestyle='--', alpha=0.5, label='Limite Seguro')
+plt.axvline(70, color='red', linestyle='--', alpha=0.5, label='Limite Crítico')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 5. LISTA DE AÇÃO PARA A TESOURARIA
+# ==========================================
+# Filtramos os Melhores Clientes: Risco menor que 10% e alto volume financeiro
+lista_de_ouro = dossie_clientes[
+    (dossie_clientes['Probabilidade_Atraso_Perc'] < 10) & 
+    (dossie_clientes['Valor_Total_Recebido'] > dossie_clientes['Valor_Total_Recebido'].median())
+].sort_values('Valor_Total_Recebido', ascending=False)
+
+print("\n" + "="*80)
+print("🏆 LISTA DE OURO: ALVOS PARA ANTECIPAÇÃO DE RECEBÍVEIS (Injeção de Caixa)")
+print("="*80)
+print("Estes clientes (AccountID) têm alto giro financeiro e Risco quase ZERO de quebra de contrato.")
+print("ESTRATÉGIA IMEDIATA: A tesouraria deve acioná-ligar oferecendo um pequeno desconto ")
+print("para pagarem os próximos recebíveis HOJE, cobrindo o déficit da semana.\n")
+
+display(lista_de_ouro[['AccountID', 'Total_Transacoes', 'Ticket_Medio', 'Intervalo_Medio_Dias', 'Probabilidade_Atraso_Perc']].head(7))
+
+================================================================================
+🏆 LISTA DE OURO: ALVOS PARA ANTECIPAÇÃO DE RECEBÍVEIS (Injeção de Caixa)
+================================================================================
+Estes clientes (AccountID) têm alto giro financeiro e Risco quase ZERO de quebra de contrato.
+ESTRATÉGIA IMEDIATA: A tesouraria deve acioná-ligar oferecendo um pequeno desconto 
+para pagarem os próximos recebíveis HOJE, cobrindo o déficit da semana.
+
+AccountID	Total_Transacoes	Ticket_Medio	Intervalo_Medio_Dias	Probabilidade_Atraso_Perc
+2749	5278	4	4192.1525	843.333333	9.401769
+2652	5123	4	4048.4775	760.000000	7.080686
+85	1132	5	3198.8440	644.000000	9.960878
+5184	9011	4	3932.6650	732.333333	8.896972
+3155	5889	4	3715.5275	789.000000	7.224417
+2974	5600	4	3578.6750	770.333333	7.013296
+4102	7366	4	3534.9600	728.333333	8.928899
